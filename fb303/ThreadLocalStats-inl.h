@@ -241,15 +241,7 @@ void TLTimeseriesT<LockTraits>::exportStat(fb303::ExportType exportType) {
 
 template <class LockTraits>
 void TLTimeseriesT<LockTraits>::aggregate(std::chrono::seconds now) {
-  int64_t currentSum;
-  int64_t currentCount;
-  {
-    // exclusive lock needed to avoid losing samples
-    auto g = this->guardStatLock();
-    currentSum = sum_.exchange(0, std::memory_order_relaxed);
-    currentCount = count_.exchange(0, std::memory_order_relaxed);
-  }
-
+  auto [currentCount, currentSum] = value_.reset();
   if (currentCount == 0) {
     return;
   }
@@ -498,8 +490,12 @@ ThreadLocalStatsT<LockTraits>::~ThreadLocalStatsT() {
 }
 
 template <class LockTraits>
-void ThreadLocalStatsT<LockTraits>::aggregate() {
+uint64_t ThreadLocalStatsT<LockTraits>::aggregate() {
   auto guard = link_->lock();
+
+  if (tlStats_.empty()) {
+    return 0;
+  }
 
   // TODO: In the future it would be nice if the stats code used a
   // std::chrono::time_point instead of just a std::chrono::duration
@@ -507,6 +503,8 @@ void ThreadLocalStatsT<LockTraits>::aggregate() {
   for (TLStatT<LockTraits>* stat : tlStats_) {
     stat->aggregate(now);
   }
+
+  return tlStats_.size();
 }
 
 template <class LockTraits>

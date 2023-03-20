@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <fb303/detail/RegexUtil.h>
 #include <folly/MapUtil.h>
 #include <glog/logging.h>
 
@@ -26,27 +27,21 @@ template <typename T>
 void CallbackValuesMap<T>::getValues(ValuesMap* output) const {
   CHECK(output);
 
-  // Do not perform actual callbacks under the global lock otherwise there is
-  // a potential for deadlocks.  Make a copy of the map first.  See t660896
-  // for more details.
+  // if callbacks were to be invoked under the lock, that could deadlock
+  // so copy under the shared lock and invoke after the lock is released
   std::vector<std::pair<std::string, std::shared_ptr<CallbackEntry>>> mapCopy;
-  size_t toReserve;
-  {
-    folly::SharedMutex::ReadHolder g(mutex_);
-    toReserve = callbackMap_.size();
-  }
-  mapCopy.reserve(toReserve);
-  {
-    folly::SharedMutex::ReadHolder g(mutex_);
-    for (const auto& entry : callbackMap_) {
+  callbackMap_.withRLock([&](auto const& map) {
+    // a vector to avoid N allocations when copying a std::map with N entries
+    mapCopy.reserve(map.map.size());
+    for (const auto& entry : map.map) {
       mapCopy.emplace_back(entry.first.str(), entry.second);
     }
-  }
+  });
 
   for (auto& it : mapCopy) {
     T result;
+    // if the entry was unregistered underneath, getValue returns false
     if (it.second->getValue(&result)) {
-      // if the entry was unregistered underneath, getValue returns failure
       (*output)[std::move(it.first)] = std::move(result);
     }
   }
@@ -55,83 +50,87 @@ void CallbackValuesMap<T>::getValues(ValuesMap* output) const {
 template <typename T>
 bool CallbackValuesMap<T>::getValue(folly::StringPiece name, T* output) const {
   CHECK(output);
-  std::shared_ptr<CallbackEntry> entry;
-  {
-    folly::SharedMutex::ReadHolder g(mutex_);
-    auto it = callbackMap_.find(name);
-    if (it == callbackMap_.end()) {
-      return false;
-    }
-    entry = it->second;
-    // do not perform actual callbacks under the global lock
-    // otherwise there is a potential for deadlocks
-    // see t660896 for more details
-  }
 
-  if (!entry->getValue(output)) {
-    // if the entry was unregistered underneath, getValue returns failure
-    return false;
-  }
+  // if callbacks were to be invoked under the lock, that could deadlock
+  // so copy under the shared lock and invoke after the lock is released
+  auto entry = folly::get_default(callbackMap_.rlock()->map, name);
 
-  return true;
+  // if the entry was unregistered underneath, getValue returns false
+  return entry && entry->getValue(output);
 }
 
 template <typename T>
 bool CallbackValuesMap<T>::contains(folly::StringPiece name) const {
-  folly::SharedMutex::ReadHolder g(mutex_);
-  return callbackMap_.find(name) != callbackMap_.end();
+  return nullptr != folly::get_ptr(callbackMap_.rlock()->map, name);
 }
 
 template <typename T>
 void CallbackValuesMap<T>::getKeys(std::vector<std::string>* keys) const {
-  folly::SharedMutex::ReadHolder g(mutex_);
-  keys->reserve(keys->size() + callbackMap_.size());
-  for (const auto& entry : callbackMap_) {
-    keys->push_back(entry.first.str());
+  auto rlock = callbackMap_.rlock();
+  keys->reserve(keys->size() + rlock->map.size());
+  for (const auto& [key, _] : rlock->map) {
+    keys->emplace_back(key);
   }
 }
 
 template <typename T>
+void CallbackValuesMap<T>::getRegexKeys(
+    std::vector<std::string>& keys,
+    const std::string& regex) const {
+  detail::getRegexKeysImpl(keys, regex, callbackMap_);
+}
+
+template <typename T>
 size_t CallbackValuesMap<T>::getNumKeys() const {
-  folly::SharedMutex::ReadHolder g(mutex_);
-  return callbackMap_.size();
+  return callbackMap_.rlock()->map.size();
 }
 
 template <typename T>
 void CallbackValuesMap<T>::registerCallback(
     folly::StringPiece name,
     const Callback& cob) {
-  folly::SharedMutex::WriteHolder g(mutex_);
-  callbackMap_[name] = std::make_shared<CallbackEntry>(cob);
+  auto wlock = callbackMap_.wlock();
+  wlock->map[name] = std::make_shared<CallbackEntry>(cob);
+
+  // avoid fetch_add() to avoid extra fences, since we hold the lock already
+  uint64_t epoch = wlock->mapEpoch.load();
+  wlock->mapEpoch.store(epoch + 1);
 }
 
 template <typename T>
 bool CallbackValuesMap<T>::unregisterCallback(folly::StringPiece name) {
-  folly::SharedMutex::WriteHolder g(mutex_);
-  auto entry = callbackMap_.find(name);
-  if (entry == callbackMap_.end()) {
+  auto wlock = callbackMap_.wlock();
+  auto entry = wlock->map.find(name);
+  if (entry == wlock->map.end()) {
     return false;
   }
   entry->second->clear();
-  callbackMap_.erase(entry);
+
+  // avoid fetch_add() to avoid extra fences, since we hold the lock already
+  uint64_t epoch = wlock->mapEpoch.load();
+  wlock->mapEpoch.store(epoch + 1);
+
+  wlock->map.erase(entry);
   VLOG(5) << "Unregistered  callback: " << name;
   return true;
 }
 
 template <typename T>
 void CallbackValuesMap<T>::clear() {
-  folly::SharedMutex::WriteHolder g(mutex_);
-  for (auto& entry : callbackMap_) {
+  auto wlock = callbackMap_.wlock();
+  for (auto& entry : wlock->map) {
     entry.second->clear();
   }
-  callbackMap_.clear();
+  // avoid fetch_add() to avoid extra fences, since we hold the lock already
+  uint64_t epoch = wlock->mapEpoch.load();
+  wlock->mapEpoch.store(epoch + 1);
+  wlock->map.clear();
 }
 
 template <typename T>
 std::shared_ptr<typename CallbackValuesMap<T>::CallbackEntry>
 CallbackValuesMap<T>::getCallback(folly::StringPiece name) {
-  folly::SharedMutex::ReadHolder g(mutex_);
-  return folly::get_default(callbackMap_, name);
+  return folly::get_default(callbackMap_.rlock()->map, name);
 }
 
 template <typename T>
@@ -140,17 +139,16 @@ CallbackValuesMap<T>::CallbackEntry::CallbackEntry(const Callback& callback)
 
 template <typename T>
 void CallbackValuesMap<T>::CallbackEntry::clear() {
-  folly::SharedMutex::WriteHolder lock(rwlock_);
-  callback_ = Callback();
+  *callback_.wlock() = Callback();
 }
 
 template <typename T>
 bool CallbackValuesMap<T>::CallbackEntry::getValue(T* output) const {
-  folly::SharedMutex::ReadHolder lock(rwlock_);
-  if (!callback_) {
+  auto rlock = callback_.rlock();
+  if (!*rlock) {
     return false;
   }
-  *output = callback_();
+  *output = (*rlock)();
   return true;
 }
 

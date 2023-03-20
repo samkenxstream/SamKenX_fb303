@@ -155,6 +155,7 @@ class ThreadCachedServiceData {
 
   void
   addStatValue(folly::StringPiece key, int64_t value, ExportType exportType);
+  void clearStat(folly::StringPiece key, ExportType exportType);
 
   void addStatValueAggregated(
       folly::StringPiece key,
@@ -356,6 +357,9 @@ class ThreadCachedServiceData {
 
   ServiceData* serviceData_;
   StatsThreadLocal* threadLocalStats_;
+  using KeyCacheTable =
+      std::array<ExportKeyCache, ExportTypeMeta::kNumExportTypes>;
+  folly::ThreadLocal<KeyCacheTable> keyCacheTable_;
 
   std::atomic<std::chrono::milliseconds> interval_{
       std::chrono::milliseconds(0)};
@@ -595,6 +599,19 @@ class FormattedKeyHolder {
         : getFormattedKeySlow(std::forward<Args>(subkeys)...);
   }
 
+  template <typename... Args>
+  void eraseFormattedKey(Args&&... subkeys) {
+    static_assert(sizeof...(Args) == N, "Incorrect number of subkeys.");
+    static_assert(
+        (IsValidSubkey<folly::remove_cvref_t<Args>> && ...),
+        "Arguments must be strings or integers");
+
+    auto decay = folly::overload(decay_<int64_t>{}, decay_<std::string_view>{});
+    // calling outline folly::get_default would be a small perf hit
+    auto& map = *localMap_; // so call map-find inline to avoid
+    map.erase(std::tuple{decay(subkeys)...});
+  }
+
  private:
   template <typename T>
   struct decay_ {
@@ -693,6 +710,7 @@ template <class TLStatT>
 class StatWrapperBase {
  public:
   explicit StatWrapperBase(std::string key) : key_(std::move(key)) {}
+  explicit StatWrapperBase(std::string_view key) : key_(key) {}
   virtual ~StatWrapperBase() = default;
 
   // Even though the destructor above is defaulted, and required as this
@@ -737,8 +755,10 @@ class CounterWrapper
   // Two constructors are provided for use in the DEFINE_counter macro below.
   // If no name is provided, then first constructor is used with the variable
   // name being the key. If a name is provided, the second constructor is used.
-  explicit CounterWrapper(const std::string& key) : StatWrapperBase(key) {}
-  CounterWrapper(const std::string& /*var*/, const std::string& key)
+  explicit CounterWrapper(std::string key) : StatWrapperBase(std::move(key)) {}
+  CounterWrapper(std::string_view /*var*/, std::string_view key)
+      : StatWrapperBase(key) {}
+  CounterWrapper(const char* /*var*/, std::string_view key)
       : StatWrapperBase(key) {}
 
   void incrementValue(CounterType amount = 1) {
@@ -768,7 +788,7 @@ class TimeseriesWrapper {
       typename Arg1,
       typename... Args,
       typename std::enable_if<
-          std::is_convertible<Arg1, std::string>::value>::type* = nullptr>
+          std::is_convertible<Arg1, std::string_view>::value>::type* = nullptr>
   TimeseriesWrapper(
       const std::string& /*varname*/,
       const Arg1& key,
@@ -794,7 +814,7 @@ class TimeseriesWrapper {
       typename Arg1,
       typename... Args,
       typename std::enable_if<
-          !std::is_convertible<Arg1, std::string>::value>::type* = nullptr,
+          !std::is_convertible<Arg1, std::string_view>::value>::type* = nullptr,
       typename std::enable_if<
           !std::is_convertible<Arg1, ExportedStat>::value>::type* = nullptr>
   TimeseriesWrapper(
@@ -878,7 +898,7 @@ class TimeseriesPolymorphicWrapper : public TimeseriesWrapperBase {
       typename Arg1,
       typename... Args,
       typename std::enable_if<
-          std::is_convertible<Arg1, std::string>::value>::type* = nullptr>
+          std::is_convertible<Arg1, std::string_view>::value>::type* = nullptr>
   TimeseriesPolymorphicWrapper(
       const std::string& /*varname*/,
       const Arg1& key,
@@ -890,7 +910,7 @@ class TimeseriesPolymorphicWrapper : public TimeseriesWrapperBase {
       typename Arg1,
       typename... Args,
       typename std::enable_if<
-          !std::is_convertible<Arg1, std::string>::value>::type* = nullptr>
+          !std::is_convertible<Arg1, std::string_view>::value>::type* = nullptr>
   TimeseriesPolymorphicWrapper(
       const std::string& varname,
       const Arg1& arg1,
@@ -945,12 +965,12 @@ struct MinuteTimeseriesWrapper : public TimeseriesWrapperBase {
     // levels.
     int _[] = {
         (ServiceData::get()->addStatExportType(
-             key_, args, &templateExportedStat_),
+             key_, args, &templateExportedStat()),
          0)...};
     (void)_;
   }
 
-  static const ExportedStat templateExportedStat_;
+  static const ExportedStat& templateExportedStat();
 };
 
 class QuarterMinuteOnlyTimeseriesWrapper : public TimeseriesWrapperBase {
@@ -977,12 +997,12 @@ class QuarterMinuteOnlyTimeseriesWrapper : public TimeseriesWrapperBase {
     // levels.
     int _[] = {
         (ServiceData::get()->addStatExportType(
-             key_, args, &templateExportedStat_),
+             key_, args, &templateExportedStat()),
          0)...};
     (void)_;
   }
 
-  static const ExportedStat templateExportedStat_;
+  static const ExportedStat& templateExportedStat();
 };
 
 struct MinuteOnlyTimeseriesWrapper : public TimeseriesWrapperBase {
@@ -1007,12 +1027,12 @@ struct MinuteOnlyTimeseriesWrapper : public TimeseriesWrapperBase {
     // levels.
     int _[] = {
         (ServiceData::get()->addStatExportType(
-             key_, args, &templateExportedStat_),
+             key_, args, &templateExportedStat()),
          0)...};
     (void)_;
   }
 
-  static const ExportedStat templateExportedStat_;
+  static const ExportedStat& templateExportedStat();
 };
 
 class HistogramWrapper {
@@ -1054,6 +1074,24 @@ class HistogramWrapper {
   folly::once_flag once_;
   std::string key_;
   internal::HistogramSpec spec_;
+};
+
+class MinuteOnlyHistogram : public HistogramWrapper {
+ public:
+  template <typename... Args>
+  MinuteOnlyHistogram(
+      const std::string& key,
+      int64_t bucketWidth,
+      int64_t min,
+      int64_t max,
+      const Args&... args)
+      : HistogramWrapper(
+            key,
+            bucketWidth,
+            min,
+            max,
+            args...,
+            MinuteOnlyTimeSeries<CounterType>()) {}
 };
 
 /**
@@ -1134,6 +1172,20 @@ class DynamicTimeseriesWrapper {
 
   // "subkeys" must be a list of exactly N strings or integers, one for each
   // subkey.
+  // E.g. clear("red", "cat");
+  //      clear("red", 42);
+  template <typename... Args>
+  void clear(Args&&... subkeys) {
+    auto const& key = key_.getFormattedKey(subkeys...);
+    for (const auto exportType : exportTypes_) {
+      ThreadCachedServiceData::get()->clearStat(key, exportType);
+    }
+    tcData().clearTimeseriesSafe(key);
+    key_.eraseFormattedKey(std::forward<Args>(subkeys)...);
+  }
+
+  // "subkeys" must be a list of exactly N strings or integers, one for each
+  // subkey.
   // E.g. addAggregated(36, 12, "red", "cat");
   //      addAggregated(48, 12, "red", 42);
   template <typename... Args>
@@ -1159,6 +1211,18 @@ class DynamicTimeseriesWrapper {
   // Only for debugging; not designed to be efficient.
   typename internal::FormattedKeyHolder<N>::GlobalMap getMap() const {
     return key_.getMap();
+  }
+
+  template <typename... Args>
+  const std::string& prepareFormattedKey(Args&&... subkeys) {
+    // getFormattedKey has a side-effect of preparing the key, so we just need
+    // to call it to ensure the stat is exported.
+    return key_.getFormattedKey(std::forward<Args>(subkeys)...);
+  }
+
+  std::shared_ptr<ThreadCachedServiceData::TLTimeseries> getDynamicCounter(
+      const std::string& key) {
+    return tcData().getTimeseriesSafe(key);
   }
 
  private:
@@ -1291,3 +1355,8 @@ constexpr int countPlaceholders(folly::StringPiece keyformat) {
       "Must have at least one placeholder.");                              \
   ::facebook::fb303::DynamicHistogramWrapper<countPlaceholders(keyformat)> \
       STATS_##varname(keyformat, bucketWidth, min, max, __VA_ARGS__)
+
+#define DECLARE_DYNAMIC_INSTANCE(timeseries, var, ...)     \
+  const std::string key##var =                             \
+      STATS_##timeseries.prepareFormattedKey(__VA_ARGS__); \
+  auto& var = *STATS_##timeseries.getDynamicCounter(key##var);

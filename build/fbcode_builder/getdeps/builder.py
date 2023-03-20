@@ -7,21 +7,27 @@
 import glob
 import json
 import os
+import pathlib
 import shutil
 import stat
 import subprocess
 import sys
+import typing
+from typing import Optional
 
 from .dyndeps import create_dyn_dep_munger
-from .envfuncs import Env, add_path_entry, path_search
+from .envfuncs import add_path_entry, Env, path_search
 from .fetcher import copy_if_different
 from .runcmd import run_cmd
+
+if typing.TYPE_CHECKING:
+    from .buildopts import BuildOptions
 
 
 class BuilderBase(object):
     def __init__(
         self,
-        build_opts,
+        build_opts: "BuildOptions",
         ctx,
         manifest,
         src_dir,
@@ -38,6 +44,8 @@ class BuilderBase(object):
         if subdir:
             src_dir = os.path.join(src_dir, subdir)
 
+        self.patchfile = manifest.get("build", "patchfile", ctx=ctx)
+        self.patchfile_opts = manifest.get("build", "patchfile_opts", ctx=ctx) or ""
         self.ctx = ctx
         self.src_dir = src_dir
         self.build_dir = build_dir or src_dir
@@ -93,14 +101,38 @@ class BuilderBase(object):
                 reconfigure = True
         return reconfigure
 
+    def _apply_patchfile(self) -> None:
+        if self.patchfile is None:
+            return
+        patched_sentinel_file = pathlib.Path(self.src_dir + "/.getdeps_patched")
+        if patched_sentinel_file.exists():
+            return
+        old_wd = os.getcwd()
+        os.chdir(self.src_dir)
+        print(f"Patching {self.manifest.name} with {self.patchfile} in {self.src_dir}")
+        patchfile = os.path.join(
+            self.build_opts.fbcode_builder_dir, "patches", self.patchfile
+        )
+        patchcmd = ["git", "apply"]
+        if self.patchfile_opts:
+            patchcmd.append(self.patchfile_opts)
+        try:
+            subprocess.check_call(patchcmd + [patchfile])
+        except subprocess.CalledProcessError:
+            raise ValueError(f"Failed to apply patch to {self.manifest.name}")
+        os.chdir(old_wd)
+        patched_sentinel_file.touch()
+
     def prepare(self, install_dirs, reconfigure: bool) -> None:
         print("Preparing %s..." % self.manifest.name)
         reconfigure = self._reconfigure(reconfigure)
+        self._apply_patchfile()
         self._prepare(install_dirs=install_dirs, reconfigure=reconfigure)
 
     def build(self, install_dirs, reconfigure: bool) -> None:
         print("Building %s..." % self.manifest.name)
         reconfigure = self._reconfigure(reconfigure)
+        self._apply_patchfile()
         self._prepare(install_dirs=install_dirs, reconfigure=reconfigure)
         self._build(install_dirs=install_dirs, reconfigure=reconfigure)
 
@@ -355,56 +387,6 @@ class Iproute2Builder(BuilderBase):
         self._run_cmd(install_cmd, env=env)
 
 
-class BistroBuilder(BuilderBase):
-    def _build(self, install_dirs, reconfigure) -> None:
-        p = os.path.join(self.src_dir, "bistro", "bistro")
-        env = self._compute_env(install_dirs)
-        env["PATH"] = env["PATH"] + ":" + os.path.join(p, "bin")
-        env["TEMPLATES_PATH"] = os.path.join(p, "include", "thrift", "templates")
-        self._run_cmd(
-            [
-                os.path.join(".", "cmake", "run-cmake.sh"),
-                "Release",
-                "-DCMAKE_INSTALL_PREFIX=" + self.inst_dir,
-            ],
-            cwd=p,
-            env=env,
-        )
-        self._run_cmd(
-            [
-                "make",
-                "install",
-                "-j",
-                str(self.num_jobs),
-            ],
-            cwd=os.path.join(p, "cmake", "Release"),
-            env=env,
-        )
-
-    def run_tests(
-        self, install_dirs, schedule_type, owner, test_filter, retry, no_testpilot
-    ) -> None:
-        env = self._compute_env(install_dirs)
-        build_dir = os.path.join(self.src_dir, "bistro", "bistro", "cmake", "Release")
-        NUM_RETRIES = 5
-        for i in range(NUM_RETRIES):
-            cmd = ["ctest", "--output-on-failure"]
-            if i > 0:
-                cmd.append("--rerun-failed")
-            cmd.append(build_dir)
-            try:
-                self._run_cmd(
-                    cmd,
-                    cwd=build_dir,
-                    env=env,
-                )
-            except Exception:
-                print(f"Tests failed... retrying ({i+1}/{NUM_RETRIES})")
-            else:
-                return
-        raise Exception(f"Tests failed even after {NUM_RETRIES} retries")
-
-
 class CMakeBuilder(BuilderBase):
     MANUAL_BUILD_SCRIPT = """\
 #!{sys.executable}
@@ -530,6 +512,7 @@ if __name__ == "__main__":
         loader=None,
         final_install_prefix=None,
         extra_cmake_defines=None,
+        cmake_target="install",
     ) -> None:
         super(CMakeBuilder, self).__init__(
             build_opts,
@@ -543,6 +526,7 @@ if __name__ == "__main__":
         self.defines = defines or {}
         if extra_cmake_defines:
             self.defines.update(extra_cmake_defines)
+        self.cmake_target = cmake_target
 
         try:
             from .facebook.vcvarsall import extra_vc_cmake_defines
@@ -725,7 +709,7 @@ if __name__ == "__main__":
                 "--build",
                 self.build_dir,
                 "--target",
-                "install",
+                self.cmake_target,
                 "--config",
                 "Release",
                 "-j",
@@ -740,6 +724,11 @@ if __name__ == "__main__":
         env = self._compute_env(install_dirs)
         ctest = path_search(env, "ctest")
         cmake = path_search(env, "cmake")
+
+        def require_command(path: Optional[str], name: str) -> str:
+            if path is None:
+                raise RuntimeError("unable to find command `{}`".format(name))
+            return path
 
         # On Windows, we also need to update $PATH to include the directories that
         # contain runtime library dependencies.  This is not needed on other platforms
@@ -774,7 +763,9 @@ if __name__ == "__main__":
 
         def list_tests():
             output = subprocess.check_output(
-                [ctest, "--show-only=json-v1"], env=env, cwd=self.build_dir
+                [require_command(ctest, "ctest"), "--show-only=json-v1"],
+                env=env,
+                cwd=self.build_dir,
             )
             try:
                 data = json.loads(output.decode("utf-8"))
@@ -798,7 +789,12 @@ if __name__ == "__main__":
                     labels.append("disabled")
                 command = test["command"]
                 if working_dir:
-                    command = [cmake, "-E", "chdir", working_dir] + command
+                    command = [
+                        require_command(cmake, "cmake"),
+                        "-E",
+                        "chdir",
+                        working_dir,
+                    ] + command
 
                 import os
 
@@ -822,11 +818,12 @@ if __name__ == "__main__":
             # better signals for flaky tests.
             retry = 0
 
-        testpilot = path_search(env, "testpilot")
         tpx = path_search(env, "tpx")
-        if (tpx or testpilot) and not no_testpilot:
+        if tpx and not no_testpilot:
             buck_test_info = list_tests()
             import os
+
+            from .facebook.testinfra import start_run
 
             buck_test_info_name = os.path.join(self.build_dir, ".buck-test-info.json")
             with open(buck_test_info_name, "w") as f:
@@ -837,27 +834,7 @@ if __name__ == "__main__":
             runs = []
             from sys import platform
 
-            if platform == "win32":
-                machine_suffix = self.build_opts.host_type.as_tuple_string()
-                testpilot_args = [
-                    "parexec-testinfra.exe",
-                    "C:/tools/testpilot/sc_testpilot.par",
-                    # Need to force the repo type otherwise testpilot on windows
-                    # can be confused (presumably sparse profile related)
-                    "--force-repo",
-                    "fbcode",
-                    "--force-repo-root",
-                    self.build_opts.fbsource_dir,
-                    "--buck-test-info",
-                    buck_test_info_name,
-                    "--retry=%d" % retry,
-                    "-j=%s" % str(self.num_jobs),
-                    "--test-config",
-                    "platform=%s" % machine_suffix,
-                    "buildsystem=getdeps",
-                    "--return-nonzero-on-failures",
-                ]
-            else:
+            with start_run(env["FBSOURCE_HASH"]) as run_id:
                 testpilot_args = [
                     tpx,
                     "--force-local-execution",
@@ -868,63 +845,73 @@ if __name__ == "__main__":
                     "--print-long-results",
                 ]
 
-            if owner:
-                testpilot_args += ["--contacts", owner]
+                if owner:
+                    testpilot_args += ["--contacts", owner]
 
-            if tpx and env:
-                testpilot_args.append("--env")
-                testpilot_args.extend(f"{key}={val}" for key, val in env.items())
+                if env:
+                    testpilot_args.append("--env")
+                    testpilot_args.extend(f"{key}={val}" for key, val in env.items())
 
-            if test_filter:
-                testpilot_args += ["--", test_filter]
+                if run_id is not None:
+                    testpilot_args += ["--run-id", run_id]
 
-            if schedule_type == "continuous":
-                runs.append(
-                    [
-                        "--tag-new-tests",
-                        "--collection",
-                        "oss-continuous",
-                        "--purpose",
-                        "continuous",
-                    ]
-                )
-            elif schedule_type == "testwarden":
-                # One run to assess new tests
-                runs.append(
-                    [
-                        "--tag-new-tests",
-                        "--collection",
-                        "oss-new-test-stress",
-                        "--stress-runs",
-                        "10",
-                        "--purpose",
-                        "stress-run-new-test",
-                    ]
-                )
-                # And another for existing tests
-                runs.append(
-                    [
-                        "--tag-new-tests",
-                        "--collection",
-                        "oss-existing-test-stress",
-                        "--stress-runs",
-                        "10",
-                        "--purpose",
-                        "stress-run",
-                    ]
-                )
-            else:
-                runs.append(["--collection", "oss-diff", "--purpose", "diff"])
+                if test_filter:
+                    testpilot_args += ["--", test_filter]
 
-            for run in runs:
-                self._run_cmd(
-                    testpilot_args + run,
-                    cwd=self.build_opts.fbcode_builder_dir,
-                    env=env,
-                    use_cmd_prefix=use_cmd_prefix,
-                )
+                if schedule_type == "diff":
+                    runs.append(["--collection", "oss-diff", "--purpose", "diff"])
+                elif schedule_type == "continuous":
+                    runs.append(
+                        [
+                            "--tag-new-tests",
+                            "--collection",
+                            "oss-continuous",
+                            "--purpose",
+                            "continuous",
+                        ]
+                    )
+                elif schedule_type == "testwarden":
+                    # One run to assess new tests
+                    runs.append(
+                        [
+                            "--tag-new-tests",
+                            "--collection",
+                            "oss-new-test-stress",
+                            "--stress-runs",
+                            "10",
+                            "--purpose",
+                            "stress-run-new-test",
+                        ]
+                    )
+                    # And another for existing tests
+                    runs.append(
+                        [
+                            "--tag-new-tests",
+                            "--collection",
+                            "oss-existing-test-stress",
+                            "--stress-runs",
+                            "10",
+                            "--purpose",
+                            "stress-run",
+                        ]
+                    )
+                else:
+                    runs.append([])
+
+                for run in runs:
+                    self._run_cmd(
+                        testpilot_args + run,
+                        cwd=self.build_opts.fbcode_builder_dir,
+                        env=env,
+                        use_cmd_prefix=use_cmd_prefix,
+                    )
         else:
-            args = [ctest, "--output-on-failure", "-j", str(self.num_jobs)]
+            args = [
+                require_command(ctest, "ctest"),
+                "--output-on-failure",
+                "-j",
+                str(self.num_jobs),
+            ]
             if test_filter:
                 args += ["-R", test_filter]
 
@@ -982,7 +969,7 @@ class OpenSSLBuilder(BuilderBase):
             bindir = os.path.join(d, "bin")
             add_path_entry(env, "PATH", bindir, append=False)
 
-        perl = path_search(env, "perl", "perl")
+        perl = typing.cast(str, path_search(env, "perl", "perl"))
 
         make_j_args = []
         if self.build_opts.is_windows():
@@ -991,7 +978,11 @@ class OpenSSLBuilder(BuilderBase):
         elif self.build_opts.is_darwin():
             make = "make"
             make_j_args = ["-j%s" % self.num_jobs]
-            args = ["darwin64-x86_64-cc"]
+            args = (
+                ["darwin64-x86_64-cc"]
+                if not self.build_opts.is_arm()
+                else ["darwin64-arm64-cc"]
+            )
         elif self.build_opts.is_linux():
             make = "make"
             make_j_args = ["-j%s" % self.num_jobs]
@@ -1146,7 +1137,7 @@ class OpenNSABuilder(NopBuilder):
             build_opts, ctx, manifest, src_dir, inst_dir
         )
 
-    def build(self, install_dirs, reconfigure) -> None:
+    def build(self, install_dirs, reconfigure: bool) -> None:
         env = self._compute_env(install_dirs)
         self._run_cmd(["git", "lfs", "install", "--local"], cwd=self.src_dir, env=env)
         self._run_cmd(["git", "lfs", "pull"], cwd=self.src_dir, env=env)

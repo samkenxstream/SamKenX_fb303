@@ -17,7 +17,6 @@
 #include "common/datastruct/SimpleLRUMap.h"
 
 #include "common/base/StlUtil.h"
-#include "common/init/Init.h"
 #include "common/time/Clock.h"
 
 #include <folly/Conv.h>
@@ -44,7 +43,7 @@ class evictedCallback {
 
  public:
   evictedCallback(key_type key, mapped_type value)
-      : key_(move(key)), value_(move(value)) {}
+      : key_(std::move(key)), value_(std::move(value)) {}
 
   void operator()(pair<const key_type, mapped_type>&& evicted) {
     EXPECT_EQ(evicted.first, key_);
@@ -62,7 +61,7 @@ evictedCallback<lru_map::key_type, lru_map::mapped_type> checkEvicted(
     lru_map::key_type key,
     lru_map::mapped_type value) {
   return evictedCallback<lru_map::key_type, lru_map::mapped_type>(
-      move(key), move(value));
+      std::move(key), std::move(value));
 }
 
 template <typename key_type, typename mapped_type>

@@ -16,6 +16,9 @@
 
 #pragma once
 
+#include <string_view>
+
+#include <fb303/LimitUtils.h>
 #include <fb303/ServiceData.h>
 #include <fb303/thrift/gen-cpp2/BaseService.h>
 #include <folly/executors/CPUThreadPoolExecutor.h>
@@ -23,6 +26,10 @@
 
 namespace facebook {
 namespace fb303 {
+
+constexpr std::string_view kCountersLimitHeader{"fb303_counters_read_limit"};
+constexpr std::string_view kEnableRegexCachedHeader{
+    "fb303_server_side_regex_enable_caching"};
 
 enum ThriftFuncAction {
   FIRST_ACTION = 0,
@@ -64,6 +71,10 @@ class BaseService : virtual public cpp2::BaseServiceSvIf {
   }
   ~BaseService() override;
 
+  static bool isThreadRegexCacheEnabled() {
+    return useRegexCacheTL_;
+  }
+
  public:
   using cpp2::BaseServiceSvIf::ServerInterface::getName;
   void getName(std::string& _return) override {
@@ -87,13 +98,17 @@ class BaseService : virtual public cpp2::BaseServiceSvIf {
   virtual void getRegexCounters(
       std::map<std::string, int64_t>& _return,
       std::unique_ptr<std::string> regex) {
-    ServiceData::get()->getRegexCounters(_return, *regex);
+    if (isThreadRegexCacheEnabled()) {
+      ServiceData::get()->getRegexCountersOptimized(_return, *regex);
+    } else {
+      ServiceData::get()->getRegexCounters(_return, *regex);
+    }
   }
 
   /*** Returns a list of counter values */
-  void getSelectedCounters(
+  virtual void getSelectedCounters(
       std::map<std::string, int64_t>& _return,
-      std::unique_ptr<std::vector<std::string>> keys) override {
+      std::unique_ptr<std::vector<std::string>> keys) {
     ServiceData::get()->getSelectedCounters(_return, *keys);
   }
 
@@ -215,8 +230,19 @@ class BaseService : virtual public cpp2::BaseServiceSvIf {
         return;
       }
       try {
+        auto* reqCtx = callback_->getRequestContext();
+        std::optional<size_t> limit =
+            readThriftHeader(reqCtx, kCountersLimitHeader);
         std::map<std::string, int64_t> res;
         getCounters(res);
+        if (limit) {
+          size_t numAvailable = res.size();
+          /*** Get first limit counters from map ***/
+          if (numAvailable > *limit) {
+            res.erase(std::next(res.begin(), *limit), res.end());
+          }
+          addCountersAvailableToResponse(reqCtx, numAvailable);
+        }
         callback_->result(res);
       } catch (...) {
         callback_->exception(std::current_exception());
@@ -243,8 +269,66 @@ class BaseService : virtual public cpp2::BaseServiceSvIf {
         return;
       }
       try {
+        // Check the header to see if limit is set
+        auto* reqCtx = callback_->getRequestContext();
+        std::optional<size_t> limit =
+            readThriftHeader(reqCtx, kCountersLimitHeader);
         std::map<std::string, int64_t> res;
+        std::optional<size_t> enable_regex_caching =
+            readThriftHeader(reqCtx, kEnableRegexCachedHeader);
+        // save and restore thread-local used for out-of-band behavior flag
+        bool save =
+            std::exchange(useRegexCacheTL_, enable_regex_caching.has_value());
         getRegexCounters(res, std::move(regex_));
+        useRegexCacheTL_ = save;
+        if (limit) {
+          size_t numAvailable = res.size();
+          /*** Get first limit counters from map ***/
+          if (numAvailable > *limit) {
+            res.erase(std::next(res.begin(), *limit), res.end());
+          }
+          addCountersAvailableToResponse(reqCtx, numAvailable);
+        }
+        callback_->result(res);
+      } catch (...) {
+        callback_->exception(std::current_exception());
+      }
+    });
+  }
+
+  void async_eb_getSelectedCounters(
+      std::unique_ptr<apache::thrift::HandlerCallback<
+          std::unique_ptr<std::map<std::string, int64_t>>>> callback,
+      std::unique_ptr<std::vector<std::string>> keys) override {
+    using clock = std::chrono::steady_clock;
+    getCountersExecutor_.add([this,
+                              callback_ = std::move(callback),
+                              keys_ = std::move(keys),
+                              start = clock::now(),
+                              keepAlive = folly::getKeepAliveToken(
+                                  getCountersExecutor_)]() mutable {
+      if (auto expiration = getCountersExpiration();
+          expiration.count() > 0 && clock::now() - start > expiration) {
+        using Exn = apache::thrift::TApplicationException;
+        callback_->exception(folly::make_exception_wrapper<Exn>(
+            Exn::TIMEOUT, "counters executor is saturated, request rejected."));
+        return;
+      }
+      try {
+        // Check the header to see if limit is set
+        auto* reqCtx = callback_->getRequestContext();
+        std::optional<size_t> limit =
+            readThriftHeader(reqCtx, kCountersLimitHeader);
+        std::map<std::string, int64_t> res;
+        getSelectedCounters(res, std::move(keys_));
+        if (limit) {
+          size_t numAvailable = res.size();
+          /*** Get first limit counters from map ***/
+          if (numAvailable > *limit) {
+            res.erase(std::next(res.begin(), *limit), res.end());
+          }
+          addCountersAvailableToResponse(reqCtx, numAvailable);
+        }
         callback_->result(res);
       } catch (...) {
         callback_->exception(std::current_exception());
@@ -264,6 +348,8 @@ class BaseService : virtual public cpp2::BaseServiceSvIf {
       2,
       std::make_shared<folly::NamedThreadFactory>("GetCountersCPU")};
   std::optional<std::chrono::milliseconds> getCountersExpiration_;
+
+  static thread_local bool useRegexCacheTL_;
 };
 
 } // namespace fb303

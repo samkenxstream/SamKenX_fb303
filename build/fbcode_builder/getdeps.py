@@ -21,16 +21,15 @@ from getdeps.buildopts import setup_build_options
 from getdeps.dyndeps import create_dyn_dep_munger
 from getdeps.errors import TransientFailure
 from getdeps.fetcher import (
-    SystemPackageFetcher,
     file_name_is_cmake_file,
     list_files_under_dir_newer_than_timestamp,
+    SystemPackageFetcher,
 )
 from getdeps.load import ManifestLoader
 from getdeps.manifest import ManifestParser
 from getdeps.platform import HostType
 from getdeps.runcmd import run_cmd
-from getdeps.subcmd import SubCmd, add_subcommands, cmd
-
+from getdeps.subcmd import add_subcommands, cmd, SubCmd
 
 try:
     import getdeps.facebook  # noqa: F401
@@ -414,7 +413,7 @@ class InstallSysDepsCmd(ProjectCmdBase):
         elif manager == "deb":
             packages = sorted(set(all_packages["deb"]))
             if packages:
-                cmd_args = ["apt", "install", "-y"] + packages
+                cmd_args = ["apt-get", "install", "-y"] + packages
         elif manager == "homebrew":
             packages = sorted(set(all_packages["homebrew"]))
             if packages:
@@ -622,15 +621,25 @@ class BuildCmd(ProjectCmdBase):
                         loader,
                         final_install_prefix=loader.get_project_install_prefix(m),
                         extra_cmake_defines=extra_cmake_defines,
+                        cmake_target=args.cmake_target if m == manifest else "install",
                         extra_b2_args=extra_b2_args,
                     )
                     builder.build(install_dirs, reconfigure=reconfigure)
 
-                    with open(built_marker, "w") as f:
-                        f.write(project_hash)
+                    # If we are building the project (not depdendency) and a specific
+                    # cmake_target (not 'install') has been requested, then we don't
+                    # set the built_marker. This allows subsequent runs of getdeps.py
+                    # for the project to run with different cmake_targets to trigger
+                    # cmake
+                    has_built_marker = False
+                    if not (m == manifest and args.cmake_target != "install"):
+                        with open(built_marker, "w") as f:
+                            f.write(project_hash)
+                            has_built_marker = True
 
-                    # Only populate the cache from continuous build runs
-                    if args.schedule_type == "continuous":
+                    # Only populate the cache from continuous build runs, and
+                    # only if we have a built_marker.
+                    if args.schedule_type == "continuous" and has_built_marker:
                         cached_project.upload()
                 elif args.verbose:
                     print("found good %s" % built_marker)
@@ -681,7 +690,10 @@ class BuildCmd(ProjectCmdBase):
     ):
         reconfigure = False
         sources_changed = False
-        if not cached_project.download():
+        if cached_project.download():
+            if not os.path.exists(built_marker):
+                fetcher.update()
+        else:
             check_fetcher = True
             if os.path.exists(built_marker):
                 check_fetcher = False
@@ -762,6 +774,11 @@ class BuildCmd(ProjectCmdBase):
                 "when compiling the current project and all its deps. "
                 'e.g: \'{"CMAKE_CXX_FLAGS": "--bla"}\''
             ),
+        )
+        parser.add_argument(
+            "--cmake-target",
+            help=("Target for cmake build."),
+            default="install",
         )
         parser.add_argument(
             "--extra-b2-args",
@@ -973,7 +990,6 @@ jobs:
             out.write("  build:\n")
             out.write("    runs-on: %s\n" % runs_on)
             out.write("    steps:\n")
-            out.write("    - uses: actions/checkout@v2\n")
 
             if build_opts.is_windows():
                 # cmake relies on BOOST_ROOT but GH deliberately don't set it in order
@@ -994,6 +1010,10 @@ jobs:
                 # that we want it to use them!
                 out.write("    - name: Fix Git config\n")
                 out.write("      run: git config --system core.longpaths true\n")
+                out.write("    - name: Disable autocrlf\n")
+                out.write("      run: git config --system core.autocrlf false\n")
+
+            out.write("    - uses: actions/checkout@v2\n")
 
             allow_sys_arg = ""
             if (
@@ -1112,7 +1132,7 @@ jobs:
             help="Allow CI to fire on all branches - Handy for testing",
         )
         parser.add_argument(
-            "--ubuntu-version", default="18.04", help="Version of Ubuntu to use"
+            "--ubuntu-version", default="20.04", help="Version of Ubuntu to use"
         )
         parser.add_argument(
             "--main-branch",

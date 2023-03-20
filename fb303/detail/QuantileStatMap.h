@@ -23,9 +23,12 @@
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 
+#include <folly/Chrono.h>
 #include <folly/Optional.h>
-#include <folly/SharedMutex.h>
+#include <folly/Synchronized.h>
+#include <folly/experimental/StringKeyedMap.h>
 #include <folly/experimental/StringKeyedUnorderedMap.h>
+#include <folly/synchronization/RelaxedAtomic.h>
 
 #include <fb303/ExportType.h>
 #include <fb303/QuantileStat.h>
@@ -70,6 +73,11 @@ class BasicQuantileStatMap {
   std::shared_ptr<stat_type> get(folly::StringPiece name) const;
   bool contains(folly::StringPiece name) const;
   void getKeys(std::vector<std::string>& keys) const;
+
+  /* Returns the keys in the map that matches regex pattern */
+  void getRegexKeys(std::vector<std::string>& keys, const std::string& regex)
+      const;
+
   size_t getNumKeys() const;
 
   folly::Optional<SnapshotEntry> getSnapshotEntry(
@@ -85,8 +93,8 @@ class BasicQuantileStatMap {
   // This method can be used to force the buffers to be flushed and
   // rebuild the digests.
   void flushAll() {
-    folly::SharedMutex::ReadHolder g(mutex_);
-    for (auto& p : counterMap_) {
+    auto countersRLock = counters_.rlock();
+    for (auto& p : countersRLock->map) {
       if (p.second.stat != nullptr) {
         p.second.stat->flush();
       }
@@ -94,9 +102,13 @@ class BasicQuantileStatMap {
   }
 
   void forgetAll() {
-    folly::SharedMutex::WriteHolder g(mutex_);
-    counterMap_.clear();
-    statMap_.clear();
+    auto countersWLock = counters_.wlock();
+    countersWLock->map.clear();
+    countersWLock->bases.clear();
+
+    // avoid fetch_add() to avoid extra fences, since we hold the lock already
+    uint64_t epoch = countersWLock->mapEpoch.load();
+    countersWLock->mapEpoch.store(epoch + 1);
   }
 
  private:
@@ -111,13 +123,21 @@ class BasicQuantileStatMap {
     std::vector<StatDef> statDefs;
   };
 
-  folly::SharedMutex mutex_;
-
-  // The key to this map is the fully qualified stat name, e.g. MyStat.p99.60
-  folly::StringKeyedUnorderedMap<CounterMapEntry> counterMap_;
-
-  // The key to this map is the base of the stat name, e.g. MyStat.
-  folly::StringKeyedUnorderedMap<StatMapEntry> statMap_;
+  // Combining counters map with cache and epoch numbers.  If epochs
+  // match, cache is valid.
+  template <typename Mapped>
+  struct MapWithKeyCache {
+    // The key to this map is the fully qualified stat name, e.g. MyStat.p99.60
+    folly::StringKeyedUnorderedMap<Mapped> map;
+    // The key to this map is the base of the stat name, e.g. MyStat.
+    folly::StringKeyedUnorderedMap<StatMapEntry> bases;
+    mutable folly::StringKeyedMap<std::vector<std::string>> regexCache;
+    mutable folly::relaxed_atomic_uint64_t mapEpoch{0};
+    mutable folly::relaxed_atomic_uint64_t cacheEpoch{0};
+    mutable folly::chrono::coarse_system_clock::time_point cacheClearTime{
+        std::chrono::seconds(0)};
+  };
+  folly::Synchronized<MapWithKeyCache<CounterMapEntry>> counters_;
 
   static std::string makeKey(
       folly::StringPiece base,

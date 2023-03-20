@@ -24,10 +24,14 @@ using std::chrono::milliseconds;
 namespace {
 static const std::string kFunctionId =
     "ThreadCachedStatsMap::aggregateAcrossAllThreads";
-}
+} // namespace
 
 namespace facebook {
 namespace fb303 {
+
+DEFINE_timeseries(fb303_tcData_publish_time_usec, SUM, AVG);
+DEFINE_timeseries(fb303_tcData_aggregate_call_count, SUM);
+DEFINE_timeseries(fb303_tcData_tlmaps_aggregated, SUM);
 
 class PublisherManager {
  public:
@@ -60,12 +64,21 @@ folly::Singleton<PublisherManager> publisherManager;
 // MinuteTenMinuteHourTimeSeries, as a blueprint for creating new timeseries
 // if one is not explicitly specified.  So we define these here that are used
 // by their respective wrapper abstractions.
-const ExportedStat MinuteTimeseriesWrapper::templateExportedStat_ =
-    MinuteTimeSeries<CounterType>();
-const ExportedStat QuarterMinuteOnlyTimeseriesWrapper::templateExportedStat_ =
-    QuarterMinuteOnlyTimeSeries<CounterType>();
-const ExportedStat MinuteOnlyTimeseriesWrapper::templateExportedStat_ =
-    MinuteOnlyTimeSeries<CounterType>();
+const ExportedStat& MinuteTimeseriesWrapper::templateExportedStat() {
+  static const folly::Indestructible<MinuteTimeSeries<CounterType>> obj;
+  return *obj.get();
+}
+
+const ExportedStat& QuarterMinuteOnlyTimeseriesWrapper::templateExportedStat() {
+  static const folly::Indestructible<QuarterMinuteOnlyTimeSeries<CounterType>>
+      obj;
+  return *obj.get();
+}
+
+const ExportedStat& MinuteOnlyTimeseriesWrapper::templateExportedStat() {
+  static const folly::Indestructible<MinuteOnlyTimeSeries<CounterType>> obj;
+  return *obj.get();
+}
 
 ThreadCachedServiceData::StatsThreadLocal&
 ThreadCachedServiceData::getStatsThreadLocal() {
@@ -95,9 +108,19 @@ ThreadCachedServiceData::ThreadCachedServiceData()
       threadLocalStats_{&ThreadCachedServiceData::getStatsThreadLocal()} {}
 
 void ThreadCachedServiceData::publishStats() {
+  auto start = std::chrono::steady_clock::now();
+  uint64_t totalAggregateCalls = 0;
+  uint64_t mapsAggregated = 0;
   for (ThreadLocalStatsMap& tlsm : threadLocalStats_->accessAllThreads()) {
-    tlsm.aggregate();
+    totalAggregateCalls += tlsm.aggregate();
+    mapsAggregated++;
   }
+  auto end = std::chrono::steady_clock::now();
+  auto interval =
+      std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+  STATS_fb303_tcData_publish_time_usec.add(interval.count());
+  STATS_fb303_tcData_aggregate_call_count.add(totalAggregateCalls);
+  STATS_fb303_tcData_tlmaps_aggregated.add(mapsAggregated);
 }
 
 void ThreadCachedServiceData::startPublishThread(milliseconds interval) {
@@ -187,19 +210,23 @@ void ThreadCachedServiceData::addHistAndStatValues(
       key, values, now, sum, nsamples, checkContains);
 }
 
+void ThreadCachedServiceData::clearStat(
+    folly::StringPiece key,
+    ExportType exportType) {
+  (*keyCacheTable_)[exportType].erase(key);
+  ServiceData::get()->addStatExportType(key, exportType, nullptr);
+}
+
 void ThreadCachedServiceData::addStatValue(
     folly::StringPiece key,
     int64_t value,
     ExportType exportType) {
-  using KeyCacheTable =
-      std::array<ExportKeyCache, ExportTypeMeta::kNumExportTypes>;
-  static folly::ThreadLocal<KeyCacheTable> keyCacheTable;
-  if (UNLIKELY(!(*keyCacheTable)[exportType].has(key))) {
+  if (UNLIKELY(!(*keyCacheTable_)[exportType].has(key))) {
     // This is not present in the threadlocal export set; possible it was
     // not yet registered with the underlying ServiceData impl.
     // This time around, pass it to the ServiceData so the type is exported
     getServiceData()->addStatExportType(key, exportType);
-    (*keyCacheTable)[exportType].add(key);
+    (*keyCacheTable_)[exportType].add(key);
   }
   // now we know the export was done; finally bump the counter
   addStatValue(key, value);

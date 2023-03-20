@@ -269,7 +269,7 @@ class TFunctionStatHandler
    * This function looks for a TStatsAggregator within the current thread's
    * thread-specific memory associated with key_, creating it if necessary.
    */
-  TStatsPerThread* getStats(const std::string& fn_name);
+  TStatsPerThread* getStats(const char* fnName);
 
   /**
    * Merge stats from a given thread
@@ -303,7 +303,8 @@ class TFunctionStatHandler
   /**
    * Construct an instance of TStatsPerThread.
    */
-  virtual std::shared_ptr<TStatsPerThread> createStatsPerThread() = 0;
+  virtual std::shared_ptr<TStatsPerThread> createStatsPerThread(
+      const char* fnName) = 0;
 
   /**
    * Calls setDefaultStat on all ExportedStatMapImpl members of this handler.
@@ -331,10 +332,10 @@ class TFunctionStatHandler
    *          cast into a void*.
    */
   void* getContext(
-      const char* fn_name,
+      const char* fnName,
       apache::thrift::server::TConnectionContext* /*serverContext*/ =
           nullptr) override {
-    auto stats = getStats(std::string(fn_name));
+    auto stats = getStats(fnName);
     return (void*)(stats->getContext());
   }
 
@@ -400,11 +401,11 @@ class TFunctionStatHandler
   /**
    * Called if the handler throws any exception.
    */
-  void userException(
+  void userExceptionWrapped(
       void* ctx,
       const char* fn_name,
-      const std::string& ex,
-      const std::string& ex_what) override;
+      bool declared,
+      const folly::exception_wrapper& ew_) final;
 };
 
 /**

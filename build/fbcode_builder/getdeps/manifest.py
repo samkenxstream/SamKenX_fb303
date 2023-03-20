@@ -11,8 +11,8 @@ from typing import List
 from .builder import (
     AutoconfBuilder,
     Boost,
+    CMakeBootStrapBuilder,
     CMakeBuilder,
-    BistroBuilder,
     Iproute2Builder,
     MakeBuilder,
     NinjaBootstrap,
@@ -20,7 +20,6 @@ from .builder import (
     OpenNSABuilder,
     OpenSSLBuilder,
     SqliteBuilder,
-    CMakeBootStrapBuilder,
 )
 from .cargo import CargoBuilder
 from .expr import parse_expr
@@ -33,7 +32,6 @@ from .fetcher import (
     SystemPackageFetcher,
 )
 from .py_wheel_builder import PythonWheelBuilder
-
 
 REQUIRED = "REQUIRED"
 OPTIONAL = "OPTIONAL"
@@ -66,6 +64,8 @@ SCHEMA = {
             "make_binary": OPTIONAL,
             "build_in_src_dir": OPTIONAL,
             "job_weight_mib": OPTIONAL,
+            "patchfile": OPTIONAL,
+            "patchfile_opts": OPTIONAL,
         },
     },
     "msbuild": {"optional_section": True, "fields": {"project": REQUIRED}},
@@ -102,6 +102,8 @@ SCHEMA = {
     "shipit.pathmap": {"optional_section": True},
     "shipit.strip": {"optional_section": True},
     "install.files": {"optional_section": True},
+    # fb-only
+    "sandcastle": {"optional_section": True, "fields": {"run_tests": OPTIONAL}},
 }
 
 # These sections are allowed to vary for different platforms
@@ -200,7 +202,6 @@ class ManifestParser(object):
         # autoconf.args section one per line
         config = configparser.RawConfigParser(allow_no_value=True)
         config.optionxform = str  # make it case sensitive
-
         if fp is None:
             with open(file_name, "r") as fp:
                 config.read_file(fp)
@@ -466,6 +467,7 @@ class ManifestParser(object):
         loader,
         final_install_prefix=None,
         extra_cmake_defines=None,
+        cmake_target=None,
         extra_b2_args=None,
     ):
         builder = self.get_builder_name(ctx)
@@ -532,16 +534,6 @@ class ManifestParser(object):
                 args += extra_b2_args
             return Boost(build_options, ctx, self, src_dir, build_dir, inst_dir, args)
 
-        if builder == "bistro":
-            return BistroBuilder(
-                build_options,
-                ctx,
-                self,
-                src_dir,
-                build_dir,
-                inst_dir,
-            )
-
         if builder == "cmake":
             defines = self.get_section_as_dict("cmake.defines", ctx)
             return CMakeBuilder(
@@ -555,6 +547,7 @@ class ManifestParser(object):
                 loader,
                 final_install_prefix,
                 extra_cmake_defines,
+                cmake_target,
             )
 
         if builder == "python-wheel":

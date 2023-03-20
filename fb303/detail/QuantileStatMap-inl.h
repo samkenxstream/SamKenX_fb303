@@ -16,7 +16,9 @@
 
 #pragma once
 
+#include <fb303/detail/RegexUtil.h>
 #include <fmt/core.h>
+#include <folly/MapUtil.h>
 
 namespace facebook {
 namespace fb303 {
@@ -39,9 +41,9 @@ folly::Optional<int64_t> BasicQuantileStatMap<ClockT>::getValue(
     folly::StringPiece key) const {
   CounterMapEntry cme;
   {
-    folly::SharedMutex::ReadHolder g(mutex_);
-    auto it = counterMap_.find(key);
-    if (it == counterMap_.end()) {
+    auto countersRLock = counters_.rlock();
+    auto it = countersRLock->map.find(key);
+    if (it == countersRLock->map.end()) {
       return folly::none;
     }
     cme = it->second;
@@ -82,8 +84,8 @@ void BasicQuantileStatMap<ClockT>::getValues(
   auto now = ClockT::now();
   // Note: Assume that stats get added rarely, so hold the read lock for the
   // entire time rather than copy the map.
-  folly::SharedMutex::ReadHolder g(mutex_);
-  for (const auto& [key, sme] : statMap_) {
+  auto countersRLock = counters_.rlock();
+  for (const auto& [key, sme] : countersRLock->bases) {
     std::vector<double> quantiles;
     for (const auto& statDef : sme.statDefs) {
       if (statDef.type == ExportType::PERCENT) {
@@ -108,10 +110,10 @@ void BasicQuantileStatMap<ClockT>::getSelectedValues(
       std::vector<std::pair<const std::string*, CounterMapEntry>>>
       stats;
   {
-    folly::SharedMutex::ReadHolder g(mutex_);
+    auto countersRLock = counters_.rlock();
     for (const auto& key : keys) {
-      auto it = counterMap_.find(key);
-      if (it != counterMap_.end()) {
+      auto it = countersRLock->map.find(key);
+      if (it != countersRLock->map.end()) {
         stats[it->second.stat.get()].emplace_back(&key, it->second);
       }
     }
@@ -149,9 +151,9 @@ void BasicQuantileStatMap<ClockT>::getSelectedValues(
 template <typename ClockT>
 std::shared_ptr<BasicQuantileStat<ClockT>> BasicQuantileStatMap<ClockT>::get(
     folly::StringPiece name) const {
-  folly::SharedMutex::ReadHolder g(mutex_);
-  auto it = statMap_.find(name);
-  if (it != statMap_.end()) {
+  auto countersRLock = counters_.rlock();
+  auto it = countersRLock->bases.find(name);
+  if (it != countersRLock->bases.end()) {
     return it->second.stat;
   }
   return nullptr;
@@ -159,24 +161,32 @@ std::shared_ptr<BasicQuantileStat<ClockT>> BasicQuantileStatMap<ClockT>::get(
 
 template <typename ClockT>
 bool BasicQuantileStatMap<ClockT>::contains(folly::StringPiece name) const {
-  folly::SharedMutex::ReadHolder g(mutex_);
-  auto it = counterMap_.find(name);
-  return it != counterMap_.end();
+  auto countersRLock = counters_.rlock();
+  auto it = countersRLock->map.find(name);
+  return (it != countersRLock->map.end());
 }
 
 template <typename ClockT>
 void BasicQuantileStatMap<ClockT>::getKeys(
     std::vector<std::string>& keys) const {
-  folly::SharedMutex::ReadHolder g(mutex_);
-  for (const auto& [key, _] : counterMap_) {
-    keys.push_back(key);
+  auto countersRLock = counters_.rlock();
+  keys.reserve(keys.size() + countersRLock->map.size());
+  for (const auto& [key, _] : countersRLock->map) {
+    keys.emplace_back(key);
   }
 }
 
 template <typename ClockT>
+void BasicQuantileStatMap<ClockT>::getRegexKeys(
+    std::vector<std::string>& keys,
+    const std::string& regex) const {
+  getRegexKeysImpl(keys, regex, counters_);
+}
+
+template <typename ClockT>
 size_t BasicQuantileStatMap<ClockT>::getNumKeys() const {
-  folly::SharedMutex::ReadHolder g(mutex_);
-  return counterMap_.size();
+  auto countersRLock = counters_.rlock();
+  return countersRLock->map.size();
 }
 
 template <typename ClockT>
@@ -184,9 +194,9 @@ folly::Optional<typename BasicQuantileStatMap<ClockT>::SnapshotEntry>
 BasicQuantileStatMap<ClockT>::getSnapshotEntry(
     folly::StringPiece name,
     TimePoint now) const {
-  folly::SharedMutex::ReadHolder g(mutex_);
-  auto it = statMap_.find(name);
-  if (it == statMap_.end()) {
+  auto countersRLock = counters_.rlock();
+  auto it = countersRLock->bases.find(name);
+  if (it == countersRLock->bases.end()) {
     return {};
   }
   SnapshotEntry entry;
@@ -202,28 +212,33 @@ BasicQuantileStatMap<ClockT>::registerQuantileStat(
     folly::StringPiece name,
     std::shared_ptr<BasicQuantileStat<ClockT>> stat,
     std::vector<BasicQuantileStatMap<ClockT>::StatDef> statDefs) {
-  folly::SharedMutex::WriteHolder g(mutex_);
-  auto it = statMap_.find(name);
-  if (it != statMap_.end()) {
+  auto countersWLock = counters_.wlock();
+  auto it = countersWLock->bases.find(name);
+  if (it != countersWLock->bases.end()) {
     return it->second.stat;
   }
   for (const auto& statDef : statDefs) {
     CounterMapEntry entry;
     entry.stat = stat;
     entry.statDef = statDef;
-    counterMap_.emplace(makeKey(name, statDef, folly::none), entry);
+    countersWLock->map.emplace(makeKey(name, statDef, folly::none), entry);
 
     auto slidingWindowLengths = stat->getSlidingWindowLengths();
 
     for (auto slidingWindowLength : slidingWindowLengths) {
       entry.slidingWindowLength = slidingWindowLength;
-      counterMap_.emplace(makeKey(name, statDef, slidingWindowLength), entry);
+      countersWLock->map.emplace(
+          makeKey(name, statDef, slidingWindowLength), entry);
     }
+
+    // avoid fetch_add() to avoid extra fences, since we hold the lock already
+    uint64_t epoch = countersWLock->mapEpoch.load();
+    countersWLock->mapEpoch.store(epoch + 1);
   }
   StatMapEntry statMapEntry;
   statMapEntry.stat = stat;
   statMapEntry.statDefs = std::move(statDefs);
-  statMap_.emplace(std::move(name), std::move(statMapEntry));
+  countersWLock->bases.emplace(std::move(name), std::move(statMapEntry));
   return stat;
 }
 
